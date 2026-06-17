@@ -1,0 +1,10 @@
+# Machine-/site-specific — never distribute these
+# the saved gateway hostname (per user)
+.citrix-host
+# fetched certificates (contain internal hostnames)
+certs/
+# run logs
+logs.txt
+
+# Large, licensed Citrix packages — download manually (see deb_files/README.md)
+deb_files/*.deb
