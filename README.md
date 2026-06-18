@@ -1,64 +1,56 @@
-# Citrix Workspace App setup (Linux VM)
+# Citrix Workspace App setup
 
-Scripts to install, certificate-fix, and cleanly uninstall the Citrix Workspace
-App / ICA client inside an Ubuntu VM. They solve the common case where the
-**browser logs in fine but the Citrix client fails with "SSL error 61"** — the
-client uses its own certificate keystore (`/opt/Citrix/ICAClient/keystore/cacerts`),
-not the system/browser trust store, and it won't auto-fetch missing intermediates.
+Helpers to run the Citrix Workspace client in a Linux VM with the gateway's CA
+chain trusted by the client's own keystore (fixing **"SSL error 61"**). Pick
+either VM — they're interchangeable: **`ubuntu/`** (apt + `.deb`) or **`nixos/`**
+(declarative flake).
 
 ## Prerequisites
 
-- **Ubuntu 24.04 (Noble)** — the expected/tested release. Other versions may
-  need a different WebKit runtime package (the install pulls
-  `libwebkit2gtk-4.1-0`, which is the 24.04 name).
-- Tools: `openssl`, `awk`, and `curl` or `wget`.
-- The Citrix `.deb` packages in `deb_files/` (an `icaclient_*.deb` and a
-  `ctxusb_*.deb`). These are **not** committed (large + licensed); download them
-  manually — see [`deb_files/README.md`](deb_files/README.md).
+- **Nix** (with flakes) — everything runs from `nix develop`, which provides
+  `vagrant`, `make` and `rsync`.
+- A **Vagrant provider**: libvirt (`vagrant-libvirt`) or VirtualBox.
+- The **Citrix downloads** in [`citrix_files/`](citrix_files/README.md) — fetched
+  once on the host and shared by both VMs.
 
-## Usage
+## Getting started
 
 ```bash
-# 1. Fetch & stage the gateway's certificate chain (prompts for the hostname)
-./ensure_certificates.sh
-
-# 2. Install Citrix (from deb_files/) and wire the certs into the keystore
-./install_citrix.sh
-
-# 3. Remove everything (e.g. to retry / reinstall)
-./uninstall_citrix.sh
+nix develop          # dev shell with vagrant, make, rsync
+make ubuntu          # or: make nixos
 ```
 
-`install_citrix.sh` auto-runs step 1 if no certs are staged yet. Verbose
-apt/dpkg output is written to `logs.txt`; the terminal shows only the steps,
-and the log tail is printed automatically if a step fails.
-
-### Options (environment variables)
-
-| Var                    | Default      | Meaning                                                          |
-| ---------------------- | ------------ | ---------------------------------------------------------------- |
-| `CITRIX_HOST`          | _(prompted)_ | Gateway hostname; skips the prompt when set                      |
-| `APP_PROTECTION`       | `yes`        | App Protection component (required by the VDI; **irreversible**) |
-| `DEVICE_TRUST` / `EPA` | `no`         | Optional deviceTRUST / Endpoint Analysis components              |
-| `INTERACTIVE`          | `0`          | `1` restores the package's own install prompts                   |
-| `DEB_DIR`              | `deb_files`  | Override the package directory                                   |
-| `SKIP_CERTS`           | `0`          | `1` installs packages only                                       |
-
-`./uninstall_citrix.sh --deps` also removes the generic GUI runtime libraries
-the installer pulled in (normally left in place, as other apps may use them).
-
-## Mounting the host share (virtiofs)
-
-Handy commands when this repo is shared into the VM via virtiofs (adjust the
-`host_citrix` tag / mountpoint to your setup):
+`make <vm>` prompts for the gateway hostname (saved to `./.citrix-host`, shared by
+both VMs), provisions the VM, then **halts** it. Start it yourself for a clean
+boot — App Protection needs one:
 
 ```bash
-# create mountpoint
-sudo mkdir -p /mnt/host_shared
-
-# mount
-sudo mount -t virtiofs host_citrix /mnt/host_shared
-
-# unmount
-sudo umount /mnt/host_shared
+cd ubuntu && vagrant up      # then open the display (virt-manager / VirtualBox)
 ```
+
+Other targets: `make ubuntu-certs` / `make nixos-certs` (re-run the cert step),
+`make ubuntu-destroy` / `make nixos-destroy`, `make <vm> PROVIDER=libvirt` (pick a
+provider). Details in [`ubuntu/README.md`](ubuntu/README.md) and
+[`nixos/README.md`](nixos/README.md).
+
+## Layout
+
+| Path            | What it is                                                                     |
+| --------------- | ------------------------------------------------------------------------------ |
+| `ubuntu/`       | Ubuntu 24.04 VM (apt + `.deb`), provisioned by Vagrant.                        |
+| `nixos/`        | Declarative NixOS VM via Vagrant + flakes (`citrix_workspace` + `extraCerts`). |
+| `shared/`       | OS-agnostic cert tooling used by both: `ensure_certificates.sh`, `common.sh`.  |
+| `citrix_files/` | Host-side Citrix downloads (`.deb` + `.tar.gz`), shared by both VMs.           |
+
+## How the certificates work
+
+The Citrix client uses its **own** keystore (`keystore/cacerts`), not the
+system/browser trust store, and won't auto-fetch missing intermediates — hence
+**SSL error 61** when it doesn't trust the gateway's CA chain.
+
+The **generation** (fetch the gateway chain, complete it, stage the CA certs as
+PEMs) lives in `shared/ensure_certificates.sh` and is reused by both VMs. They
+differ only in how the staged certs are _consumed_: Ubuntu copies them into the
+keystore at install time; NixOS feeds them to `extraCerts` so they're baked in at
+build time. The chain is staged **inside the guest** and never committed — a
+corporate CA can disclose internal PKI, and this is a public repo.

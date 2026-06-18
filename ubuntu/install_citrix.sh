@@ -2,18 +2,18 @@
 #
 # install_citrix.sh
 #
-# Purpose (2/3): install the Citrix client from the local .deb packages in
-# deb_files/, then copy the staged HTTPS CA certificates into the Citrix
-# keystore so the client trusts the gateway (fixes "SSL error 61").
+# Purpose (2/3): install the Citrix client from the local .deb packages in the
+# shared ../citrix_files/ dir, then copy the staged HTTPS CA certificates into
+# the Citrix keystore so the client trusts the gateway (fixes "SSL error 61").
 #
-# The deb_files/ directory must contain an icaclient_*.deb and a ctxusb_*.deb
-# (the newest match of each is used).
+# ../citrix_files/ (shared with the NixOS setup) must contain an icaclient_*.deb
+# and a ctxusb_*.deb (the newest match of each is used).
 #
 # Usage:
 #   ./install_citrix.sh
 #
 # Env vars:
-#   DEB_DIR     override the package dir (default: <script dir>/deb_files)
+#   DEB_DIR     override the package dir (default: <repo>/citrix_files)
 #   CERT_DIR    staging dir produced by ensure_certificates.sh
 #               (default: <script dir>/certs)
 #   SKIP_CERTS  set to 1 to install the packages only, without touching certs
@@ -21,9 +21,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "$SCRIPT_DIR/common.sh"
+SHARED_DIR="$(cd "$SCRIPT_DIR/../shared" && pwd)"
+. "$SHARED_DIR/common.sh"
 
-CERT_DIR="${CERT_DIR:-$SCRIPT_DIR/certs}"
+# Exported so the ensure_certificates.sh sub-run (now in ../shared) stages into
+# the same dir we later read from, instead of its own default next to itself.
+export CERT_DIR="${CERT_DIR:-$SCRIPT_DIR/certs}"
 SKIP_CERTS="${SKIP_CERTS:-0}"
 
 # Optional components the installer normally prompts for (debconf). Override with
@@ -41,8 +44,8 @@ REHASH="$ICAROOT/util/ctx_rehash"
 log_banner "install_citrix"
 
 # ---- 1. resolve the package directory --------------------------------------
-DEB_DIR="${DEB_DIR:-$SCRIPT_DIR/deb_files}"
-[ -d "$DEB_DIR" ] || die "package directory not found: $DEB_DIR (expected the deb_files/ dir with icaclient_*.deb and ctxusb_*.deb)"
+DEB_DIR="${DEB_DIR:-$SCRIPT_DIR/../citrix_files}"
+[ -d "$DEB_DIR" ] || die "package directory not found: $DEB_DIR (expected the shared citrix_files/ dir with icaclient_*.deb and ctxusb_*.deb)"
 
 # Pick the newest match of each package (version-sorted).
 icaclient_deb=$(ls -1 "$DEB_DIR"/icaclient_*.deb 2>/dev/null | sort -V | tail -1 || true)
@@ -101,6 +104,7 @@ try_run "Installing GUI runtime dependencies the package omits" \
 		libwebkit2gtk-4.1-0 \
 		libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
 		libhyphen0 libenchant-2-2 libsecret-1-0 libmanette-0.2-0 \
+		libsoup2.4-1 libopengl0 \
 	|| warn "some optional runtime deps could not be installed (continuing)"
 
 log "Scanning Citrix binaries for missing shared libraries ..."
@@ -130,13 +134,13 @@ fi
 STAGE="$CERT_DIR/staged"
 if ! ls "$STAGE"/*.pem >/dev/null 2>&1; then
 	warn "No staged certificates in $STAGE."
-	if [ -x "$SCRIPT_DIR/ensure_certificates.sh" ]; then
+	if [ -x "$SHARED_DIR/ensure_certificates.sh" ]; then
 		# Resolve the host now so the sub-run inherits it (no second prompt).
 		resolve_citrix_host
 		log "Running ensure_certificates.sh to fetch and stage them ..."
-		"$SCRIPT_DIR/ensure_certificates.sh"
+		"$SHARED_DIR/ensure_certificates.sh"
 	else
-		die "run ./ensure_certificates.sh first to stage the CA certificates"
+		die "run ../shared/ensure_certificates.sh first to stage the CA certificates"
 	fi
 fi
 ls "$STAGE"/*.pem >/dev/null 2>&1 || die "still no staged certificates in $STAGE"

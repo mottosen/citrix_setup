@@ -1,0 +1,163 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Ubuntu 24.04 VM for the Citrix Workspace client — the Vagrant counterpart to
+# running install_citrix.sh by hand. Supports both VirtualBox and libvirt. The
+# whole repo is shared at /vagrant so the guest reaches the install script
+# (/vagrant/ubuntu), the shared cert tooling (/vagrant/shared) and the Citrix
+# packages (/vagrant/citrix_files). See README.md.
+
+# Gateway hostname for unattended cert generation. Resolved from, in order:
+#   1. CITRIX_HOST in the host environment  (e.g. `CITRIX_HOST=vdi.example.com vagrant up`)
+#   2. a local, git-ignored `../.citrix-host` file at the repo root (one line),
+#      shared with the NixOS VM
+# If neither is set, only the packages are installed; certs are added later.
+host_file   = File.join(File.dirname(__FILE__), "..", ".citrix-host")
+citrix_host = ENV["CITRIX_HOST"]
+citrix_host ||= File.read(host_file).strip if File.exist?(host_file)
+citrix_host = citrix_host.to_s
+
+vm_name = "citrix-vm-ubuntu"
+
+Vagrant.configure("2") do |config|
+  # Name the machine (otherwise Vagrant calls it "default" and libvirt names the
+  # domain "<dir>_default"). Reused as the guest hostname.
+  config.vm.define vm_name
+
+  config.vm.box      = "cloud-image/ubuntu-24.04"
+  config.vm.hostname = vm_name
+
+  # Share the whole repo root at /vagrant via rsync — same as the NixOS VM, and
+  # robust regardless of guest additions / 9p-kernel support on the cloud image.
+  # One-way is fine: the guest only reads /vagrant. Re-sync after local edits
+  # with `vagrant rsync` (or it re-syncs on up/reload/provision).
+  config.vm.synced_folder "..", "/vagrant", type: "rsync",
+    rsync__exclude: [".git/", ".citrix-host", "*/certs/", "*/logs.txt"]
+
+  # ---- VirtualBox: open the display window so you see the desktop -----------
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = 6144
+    vb.cpus   = 4
+    vb.gui    = true
+  end
+
+  # ---- libvirt: SPICE display (virt-manager / virt-viewer) + bigger disk ----
+  config.vm.provider :libvirt do |lv|
+    lv.memory               = 6144
+    lv.cpus                 = 4
+    lv.default_prefix       = ""      # domain = the machine name, not "<dir>_<name>"
+    lv.machine_virtual_size = 30      # GB — room for the desktop + Citrix
+    lv.graphics_type        = "spice" # clipboard/auto-resize with spice-vdagent
+    lv.video_type           = "virtio" # virtio-gpu: real KMS + mesa, unlike qxl
+                                       # whose Xorg driver segfaults without a DRM
+                                       # device. Needs the generic kernel (below).
+  end
+
+  # ---- 1. desktop: GNOME + GDM ----------------------------------------------
+  # Needed both to view the Citrix GUI and for App Protection, which requires a
+  # GNOME desktop + GDM (the same requirement as the NixOS VM). install_citrix.sh
+  # enables App Protection by default (APP_PROTECTION=yes).
+  config.vm.provision "desktop", type: "shell", inline: <<-SHELL
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Keep Ubuntu's snap apps out (Firefox snap, snap-store): they drag in huge
+    # content snaps (mesa-2404, gnome-*-2404, core24) that crawl over the network.
+    # Block snapd with an apt pin and remove it (the cloud image ships it and
+    # seeds snaps); apt then skips any snap-backed recommends.
+    cat >/etc/apt/preferences.d/nosnap.pref <<'EOF'
+Package: snapd
+Pin: release a=*
+Pin-Priority: -10
+EOF
+    systemctl stop snapd.socket snapd.service 2>/dev/null || true
+    snap remove --purge firefox snap-store gnome-42-2404 gnome-46-2404 mesa-2404 2>/dev/null || true
+    apt-get purge -y snapd || true
+    # Real Firefox from Mozilla's APT repo. Ubuntu's own 'firefox' deb is only a
+    # transitional shim to the snap (which we've blocked), so we add Mozilla's repo
+    # and pin it above Ubuntu's package — apt then installs Mozilla's .deb, no snap.
+    # Firefox provides the WebKit/GTK runtime Citrix's embedded gateway-logon view
+    # needs (and is a general browser). Needs curl + ca-certificates (in the image).
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg \
+      -o /etc/apt/keyrings/packages.mozilla.org.asc
+    echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+      > /etc/apt/sources.list.d/mozilla.list
+    cat >/etc/apt/preferences.d/mozilla.pref <<'EOF'
+Package: firefox*
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000
+EOF
+
+    apt-get update -y
+    # Bring the base image fully up to date before installing anything on top
+    # (DEBIAN_FRONTEND=noninteractive above keeps it unattended).
+    apt-get upgrade -y
+
+    # The cloud image ships the stripped 'kvm' kernel with NO GPU/DRM drivers, so
+    # /dev/dri/card0 never appears and GDM's Xorg segfaults probing modes (UXA path).
+    # The generic kernel carries the virtio-gpu/qxl DRM modules, so KMS works and the
+    # desktop can render. A reboot (vagrant reload) is needed to boot into it.
+    apt-get install -y linux-generic
+
+    # GNOME + GDM. Recommends are LEFT ON (no --no-install-recommends): in a VM the
+    # session needs them to actually light up a display — mesa DRI drivers, the Xorg
+    # fallback stack, dbus-user-session (autologin session bus) and the desktop
+    # portals. Stripping recommends gives GDM no rendering context on the qxl/virtio
+    # GPU → flashing-text-then-black boot loop. None of these packages recommend
+    # firefox, and snapd is gone, so this pulls zero snaps. xwayland: Citrix X11 client.
+    apt-get install -y \
+      gnome-session gnome-shell gdm3 gnome-terminal gnome-control-center \
+      xwayland network-manager-gnome \
+      libgl1-mesa-dri dbus-user-session xdg-desktop-portal-gnome \
+      firefox
+
+    # The VM has no GPU. The Citrix client's embedded WebKit logon view (and Mesa)
+    # try the GPU path first — ZINK/Vulkan, DMABUF — and only then fall back to
+    # software, and that attempt intermittently fails/races, so the login prompt
+    # sometimes doesn't render. Force deterministic software (llvmpipe) GL +
+    # disable WebKit's GPU/compositing paths so the logon loads every time. Read by
+    # the systemd user session, so the GNOME-spawned Citrix processes inherit it.
+    install -d /etc/environment.d
+    cat >/etc/environment.d/10-citrix-gl.conf <<'EOF'
+LIBGL_ALWAYS_SOFTWARE=1
+GALLIUM_DRIVER=llvmpipe
+WEBKIT_DISABLE_COMPOSITING_MODE=1
+WEBKIT_DISABLE_DMABUF_RENDERER=1
+EOF
+
+    # Autologin as vagrant + boot into the graphical session.
+    install -d /etc/gdm3
+    cat >/etc/gdm3/custom.conf <<'EOF'
+[daemon]
+AutomaticLoginEnable=true
+AutomaticLogin=vagrant
+EOF
+    systemctl set-default graphical.target
+  SHELL
+
+  # ---- 2. citrix: run the existing installer unattended ---------------------
+  # Runs as root. CERT_DIR/HOST_CONF/LOG point at a writable path (not the share).
+  # Re-run on its own with: vagrant provision --provision-with citrix
+  config.vm.provision "citrix", type: "shell",
+    env: { "CITRIX_HOST" => citrix_host }, inline: <<-SHELL
+    set -u
+    export CERT_DIR=/var/lib/citrix-certs
+    export HOST_CONF=/var/lib/citrix-certs/.citrix-host
+    export LOG=/var/lib/citrix-certs/logs.txt
+    mkdir -p "$CERT_DIR"
+
+    if [ -n "${CITRIX_HOST:-}" ]; then
+      echo "Installing Citrix for $CITRIX_HOST (with certs) ..."
+      bash /vagrant/ubuntu/install_citrix.sh \
+        || echo "Install failed — are the .debs in citrix_files/ and the gateway reachable? See ../citrix_files/README.md"
+    else
+      echo "CITRIX_HOST not set — installing packages only (no certs)."
+      SKIP_CERTS=1 bash /vagrant/ubuntu/install_citrix.sh \
+        || echo "Install failed — are the .debs in citrix_files/? See ../citrix_files/README.md"
+      echo "Add the gateway certs later with: make certs"
+    fi
+
+    echo "NOTE: reboot (vagrant reload) to enter the desktop and activate App Protection."
+  SHELL
+end

@@ -6,5 +6,10 @@ certs/
 # run logs
 logs.txt
 
-# Large, licensed Citrix packages — download manually (see deb_files/README.md)
-deb_files/*.deb
+# Large, licensed Citrix downloads, shared by both VMs (see citrix_files/README.md)
+citrix_files/*.deb
+citrix_files/*.tar.gz
+
+flake.lock
+.direnv
+.vagrant

@@ -1,0 +1,142 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Minimal NixOS VM for the Citrix Workspace client. Supports both VirtualBox and
+# libvirt. The whole repo is shared into the guest at /vagrant (not just nixos/),
+# so the guest can reach both the flake (/vagrant/nixos) and the shared cert
+# script (/vagrant/shared). See README.md for the cert workflow.
+
+# Gateway hostname for unattended certificate generation. Resolved from, in order:
+#   1. CITRIX_HOST in the host environment  (e.g. `CITRIX_HOST=vdi.example.com vagrant up`)
+#   2. a local, git-ignored `../.citrix-host` file at the repo root (one line),
+#      shared with the Ubuntu VM
+# If neither is set, the cert step is skipped — provisioning can't prompt — and
+# you run it later inside the guest (see README.md).
+host_file   = File.join(File.dirname(__FILE__), "..", ".citrix-host")
+citrix_host = ENV["CITRIX_HOST"]
+citrix_host ||= File.read(host_file).strip if File.exist?(host_file)
+citrix_host = citrix_host.to_s
+
+vm_name = "citrix-vm-nixos"
+
+# Shared cert-staging snippet: stage the gateway CA chain (VM-local) and rebuild to
+# bake it into the keystore. Tolerant of an unreachable gateway. Embedded into the
+# bootstrap provisioner (so it runs in the SAME ssh session as the first rebuild —
+# avoiding a fresh "not ready for SSH" connection while sshd is restarting) and also
+# offered as a standalone, on-demand `certs` provisioner for re-runs. Single-quoted
+# heredoc: no Ruby interpolation, so the shell's own $VARs pass through untouched.
+certs_step = <<-'CERTS'
+    if [ -z "${CITRIX_HOST:-}" ]; then
+      echo "CITRIX_HOST not set (host env or ../.citrix-host) — skipping cert generation."
+      echo "Re-run later with: make nixos-certs"
+    else
+      export CERT_DIR=/var/lib/citrix-certs
+      export HOST_CONF=/var/lib/citrix-certs/.citrix-host
+      export LOG=/var/lib/citrix-certs/logs.txt
+      mkdir -p "$CERT_DIR"
+      echo "Staging gateway CA chain for $CITRIX_HOST ..."
+      if /vagrant/shared/ensure_certificates.sh; then
+        echo "Re-building to bake the certs into the Citrix keystore ..."
+        # Tolerate a non-zero exit: the certs are baked into the generation at BUILD
+        # time, so a benign live-activation hiccup (dbus-broker reload failing
+        # mid-switch) doesn't lose them — a reboot applies the new generation cleanly.
+        nixos-rebuild switch --impure --flake "path:/vagrant/nixos#dev-vm" \
+          || echo "Rebuild exited non-zero (likely a benign activation hiccup); the certs are in the new generation — reboot to apply."
+      else
+        echo "Cert generation failed (gateway unreachable? VPN down?) — keystore left as-is."
+        echo "Re-run once reachable with: make nixos-certs"
+      fi
+    fi
+CERTS
+
+Vagrant.configure("2") do |config|
+  # Name the machine (otherwise Vagrant calls it "default" and libvirt names the
+  # domain "<dir>_default"). Reused as the guest hostname.
+  config.vm.define vm_name
+
+  # Bootstrap image only — supports BOTH libvirt and virtualbox (amd64). The
+  # flake rebuild below upgrades the running system to its own nixpkgs (26.05),
+  # so the box's release just provides the first boot environment + hardware
+  # config. Bump box_version as the box publishes newer builds.
+  config.vm.box         = "boxen/nixos-25.05"
+  config.vm.box_version = "2025.08.20.12"
+  config.vm.hostname    = vm_name
+
+  # NixOS's /etc/fstab is Nix-generated and read-only. Stop Vagrant from writing
+  # its persistence marker block there (it does so even for rsync folders), which
+  # otherwise fails with "/etc/fstab: Read-only file system".
+  config.vm.allow_fstab_modification = false
+
+  # Share the whole repo root (".." relative to this file) at /vagrant via rsync.
+  # rsync (not virtiofs/9p/vboxsf) because NixOS's /etc/fstab is generated and
+  # read-only: Vagrant's mount-based shares fail trying to append to it. rsync
+  # copies over SSH and touches no fstab. We only ever READ /vagrant in the guest
+  # (the flake + shared scripts), so a one-way copy is sufficient. Re-sync after
+  # local edits with `vagrant rsync` (or it re-syncs on up/reload/provision).
+  config.vm.synced_folder "..", "/vagrant", type: "rsync",
+    rsync__exclude: [".git/", ".citrix-host", "*/certs/", "*/logs.txt"]
+
+  # ---- VirtualBox: open the display window so you see the desktop -----------
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = 6144
+    vb.cpus   = 4
+    vb.gui    = true
+  end
+
+  # ---- libvirt: SPICE display so it shows in virt-manager / virt-viewer -----
+  # (clipboard + auto-resize via spice-vdagent in the guest)
+  config.vm.provider :libvirt do |lv|
+    lv.memory         = 6144
+    lv.cpus           = 4
+    lv.default_prefix = "" # domain = the machine name, not "<dir>_<name>"
+    lv.graphics_type  = "spice"
+    lv.video_type     = "qxl"
+    # SPICE agent channel — vagrant-libvirt doesn't add it, and without it there's
+    # no pipe for clipboard sharing/auto-resize even though spice-vdagentd runs in
+    # the guest. (Under GNOME Wayland, clipboard sync also depends on Mutter
+    # exposing a data-control protocol; this channel is the necessary first half.)
+    lv.channel :type => "spicevmc", :target_name => "com.redhat.spice.0", :target_type => "virtio"
+  end
+
+  # ---- bootstrap: first build, then stage certs in the SAME ssh session -----
+  # The first `nixos-rebuild switch` restarts sshd/systemd. Keeping the cert step
+  # (a second rebuild) in this one provisioner means we never open a fresh SSH
+  # connection mid-restart — which is what made the old separate `certs` step fail
+  # with "not ready for SSH" on `vagrant up`.
+  config.vm.provision "bootstrap", type: "shell",
+    env: { "CITRIX_HOST" => citrix_host }, inline: <<-SHELL
+    set -u
+    export NIX_CONFIG="experimental-features = nix-command flakes"
+
+    # citrix_workspace uses requireFile (Citrix forbids redistribution): register
+    # the manually-downloaded Linux tarball from the shared citrix_files/ dir in
+    # the store so the build can find it. See ../citrix_files/README.md.
+    for f in /vagrant/citrix_files/*.tar.gz; do
+      [ -e "$f" ] || continue
+      nix-prefetch-url "file://$f" || true
+    done
+
+    # First build (no extra certs yet). This also installs openssl/curl/gawk,
+    # which the cert step needs.
+    # --impure : the flake reads /var/lib/citrix-certs/staged (empty for now).
+    # path:... : copies the dir verbatim, so untracked flake files are visible.
+    # Don't gate the cert step on the exit code: a `switch` can exit non-zero for a
+    # benign live-activation hiccup (e.g. dbus-broker reload / user-session activation
+    # failing mid-switch) even though the generation built and is the boot default. We
+    # still want to stage certs in that case. A genuine build failure (missing tarball)
+    # just makes the cert rebuild below fail too — harmlessly.
+    nixos-rebuild switch --impure --flake "path:/vagrant/nixos#dev-vm" \
+      || echo "First rebuild returned non-zero (build error, or a benign activation hiccup) — continuing."
+#{certs_step}
+  SHELL
+
+  # ---- certs (on-demand): re-stage the chain and rebuild --------------------
+  # `run: "never"` so it does NOT run on `vagrant up` (bootstrap already did it in
+  # one session) — only when explicitly invoked on a stable machine, where a fresh
+  # connection is safe: `make nixos-certs` (= vagrant provision --provision-with certs).
+  config.vm.provision "certs", type: "shell", run: "never",
+    env: { "CITRIX_HOST" => citrix_host }, inline: <<-SHELL
+    set -u
+#{certs_step}
+  SHELL
+end

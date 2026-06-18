@@ -34,7 +34,7 @@ done
 
 # ---- helpers ---------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "$SCRIPT_DIR/common.sh"
+. "$(cd "$SCRIPT_DIR/../shared" && pwd)/common.sh"
 
 log_banner "uninstall_citrix"
 
