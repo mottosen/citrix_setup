@@ -134,6 +134,38 @@ AutomaticLoginEnable=true
 AutomaticLogin=vagrant
 EOF
     systemctl set-default graphical.target
+
+    # Give the vagrant user a real password. The cloud image ships it LOCKED
+    # ("L"), which is fine for SSH-key login + GDM autologin, but a known
+    # password is handy for the odd GUI prompt (polkit, sudo in a terminal, a
+    # manual unlock). chpasswd also unlocks the account. This is a throwaway
+    # local testing VM, so a trivial password is acceptable.
+    echo 'vagrant:1234' | chpasswd
+
+    # Even with a password set above, this is an unattended testing VM, so we
+    # don't want GNOME idle-locking the desktop or suspending on inactivity (the
+    # original symptom: it slept and then sat at an unlock prompt). Disable the
+    # screen lock and idle blank/suspend via a system dconf db so it applies to
+    # the autologin session (and survives rebuilds). Mirrors
+    # disable_screen_lock.sh, which applies the same thing to a running VM.
+    install -d /etc/dconf/db/local.d /etc/dconf/profile
+    cat >/etc/dconf/profile/user <<'EOF'
+user-db:user
+system-db:local
+EOF
+    cat >/etc/dconf/db/local.d/00-no-lock <<'EOF'
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+idle-activation-enabled=false
+
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-type='nothing'
+EOF
+    dconf update
   SHELL
 
   # ---- 2. citrix: run the existing installer unattended ---------------------
